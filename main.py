@@ -37,7 +37,10 @@ class RecallCancelPlugin(Star):
     @filter.on_llm_request(priority=1)
     async def track_llm_request(self, event: AstrMessageEvent, req):
         """跟踪LLM请求开始"""
-        message_id = event.message_obj.message_id
+        if not event.message_obj.message_id:
+            return
+            
+        message_id = str(event.message_obj.message_id)
         if message_id:
             self.pending_llm_requests[message_id] = {
                 "session_id": event.unified_msg_origin,
@@ -50,14 +53,17 @@ class RecallCancelPlugin(Star):
     @filter.on_llm_response(priority=1)
     async def track_llm_response(self, event: AstrMessageEvent, resp):
         """跟踪LLM响应完成"""
-        message_id = event.message_obj.message_id
+        if not event.message_obj.message_id:
+            return
+            
+        message_id = str(event.message_obj.message_id)
         if message_id in self.pending_llm_requests:
             # 检查是否已被撤回信息
             if self.pending_llm_requests[message_id].get("cancelled", False):
                 logger.info(f"LLM响应已被撤回取消: {message_id}")
                 event.stop_event()  # 阻止后续发送
                 # 清理已取消的请求记录
-                del self.pending_llm_requests[message_id]
+                self.pending_llm_requests.pop(message_id, None)
                 return
 
             # 不要在这里删除记录，因为消息还未发送
@@ -67,20 +73,49 @@ class RecallCancelPlugin(Star):
     @filter.on_decorating_result(priority=1)
     async def check_before_send(self, event: AstrMessageEvent):
         """在消息发送前最后检查是否已被撤回"""
-        message_id = event.message_obj.message_id
-        if message_id in self.pending_llm_requests:
-            if self.pending_llm_requests[message_id].get("cancelled", False):
-                logger.info(f"发送前检测到撤回取消: {message_id}")
-                event.stop_event()  # 阻止发送
-                del self.pending_llm_requests[message_id]
+        if not event.message_obj.message_id:
+            return
+            
+        message_id = str(event.message_obj.message_id)
+        
+        # 如果不在记录中，直接返回
+        if message_id not in self.pending_llm_requests:
+            return
+            
+        # 第一次检查
+        if self.pending_llm_requests[message_id].get("cancelled", False):
+            logger.info(f"发送前检测到撤回取消: {message_id}")
+            event.stop_event()  # 阻止发送
+            self.pending_llm_requests.pop(message_id, None)
+            return
+
+        # 增加微小延迟，处理秒撤回的竞态条件
+        # 这里必须加上 try-except，防止在 sleep 期间 key 被删除导致 KeyError
+        try:
+            await asyncio.sleep(0.5)
+            
+            # 再次检查 key 是否存在 (可能已被清理)
+            if message_id not in self.pending_llm_requests:
                 return
+
+            # 第二次检查
+            if self.pending_llm_requests[message_id].get("cancelled", False):
+                logger.info(f"发送前(延迟后)检测到撤回取消: {message_id}")
+                event.stop_event()  # 阻止发送
+                self.pending_llm_requests.pop(message_id, None)
+                return
+        except Exception as e:
+            logger.warning(f"撤回检查过程出现异常: {e}")
 
     @filter.after_message_sent(priority=1)
     async def clean_sent_message(self, event: AstrMessageEvent):
         """消息发送后清理记录"""
-        message_id = event.message_obj.message_id
+        if not event.message_obj.message_id:
+            return
+            
+        message_id = str(event.message_obj.message_id)
         if message_id in self.pending_llm_requests:
-            del self.pending_llm_requests[message_id]
+            self.pending_llm_requests.pop(message_id, None)
             logger.debug(f"清理已发送消息的记录: {message_id}")
 
     @filter.command("recall_status", alias={"撤回状态"})
