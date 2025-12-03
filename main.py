@@ -23,6 +23,10 @@ class RecallCancelPlugin(Star):
 
         # 存储正在处理的LLM请求：message_id -> session_info
         self.pending_llm_requests: Dict[str, Dict[str, Any]] = {}
+        
+        # 存储最近撤回的消息：message_id -> {timestamp, user_id, group_id, is_private}
+        # 用于处理 "先撤回，后触发LLM请求" 的竞态条件，并支持模糊匹配
+        self.recalled_messages: Dict[str, Dict[str, Any]] = {}
 
         # 清理任务
         self.cleanup_task = None
@@ -42,10 +46,47 @@ class RecallCancelPlugin(Star):
             
         message_id = str(event.message_obj.message_id)
         if message_id:
+            current_time = asyncio.get_running_loop().time()
+            
+            # 1. 精确匹配检查：该消息是否已经被撤回
+            if message_id in self.recalled_messages:
+                logger.info(f"LLM请求已被提前撤回(精确): {message_id}")
+                event.stop_event()
+                return
+            
+            # 2. 模糊匹配检查：检查同一发送者、同一会话、短时间内的撤回
+            # 这可以处理消息ID变化的情况，以及消息ID获取不一致的问题
+            sender_id = event.get_sender_id()
+            group_id = event.get_group_id()
+            is_private = event.is_private_chat()
+            
+            for recalled_id, info in self.recalled_messages.items():
+                # 时间窗口检查 (5秒内，考虑到网络延迟)
+                if current_time - info["timestamp"] > 5:
+                    continue
+                
+                # 检查发送者
+                if info["user_id"] != sender_id:
+                    continue
+                
+                # 检查会话环境
+                is_match = False
+                if is_private and info["is_private"]:
+                    # 私聊匹配
+                    is_match = True
+                elif not is_private and not info["is_private"] and info["group_id"] == group_id:
+                    # 群聊匹配
+                    is_match = True
+                
+                if is_match:
+                    logger.info(f"LLM请求已被提前撤回(模糊匹配): 请求ID {message_id} -> 撤回ID {recalled_id}")
+                    event.stop_event()
+                    return
+
             self.pending_llm_requests[message_id] = {
                 "session_id": event.unified_msg_origin,
                 "event": event,
-                "timestamp": asyncio.get_running_loop().time(),
+                "timestamp": current_time,
                 "cancelled": False,
             }
             logger.debug(f"记录LLM请求: {message_id} - {event.unified_msg_origin}")
@@ -157,10 +198,6 @@ class RecallCancelPlugin(Star):
             notice_type = get_value(raw_message, "notice_type")
             message_id = get_value(raw_message, "message_id")
 
-            logger.debug(
-                f"检测到事件: post_type={post_type}, notice_type={notice_type}, message_id={message_id}"
-            )
-
             # 检查是否是群消息撤回或好友消息撤回事件
             if post_type == "notice" and notice_type in [
                 "group_recall",
@@ -172,26 +209,88 @@ class RecallCancelPlugin(Star):
                     return
 
                 recalled_message_id = str(message_id)
-                logger.info(f"检测到消息撤回: {recalled_message_id}")
+                logger.info(f"检测到消息撤回: {recalled_message_id} (类型: {notice_type})")
+                
+                # 提取上下文信息
+                group_id = str(get_value(raw_message, "group_id", ""))
+                user_id = str(get_value(raw_message, "user_id", "")) # 消息发送者
+                is_private = notice_type == "friend_recall"
+                
+                # 记录撤回的消息，防止后续可能的LLM请求 (处理竞态条件)
+                self.recalled_messages[recalled_message_id] = {
+                    "timestamp": asyncio.get_running_loop().time(),
+                    "user_id": user_id,
+                    "group_id": group_id,
+                    "is_private": is_private
+                }
 
-                # 检查是否有对应的LLM请求正在处理
+                # 精确匹配
+                matched_request = None
+                match_type = "精确匹配"
+
                 if recalled_message_id in self.pending_llm_requests:
-                    request_info = self.pending_llm_requests[recalled_message_id]
-                    request_info["cancelled"] = True
+                    matched_request = self.pending_llm_requests[recalled_message_id]
+                else:
+                    # 模糊匹配策略
+                    # 当精确匹配失败时，尝试查找同一会话中最近的请求
+                    # 条件：
+                    # 1. 同一会话 (Group ID 或 User ID 匹配)
+                    # 2. 同一发送者 (User ID 匹配)
+                    # 3. 时间在最近 60 秒内
+                    
+                    current_time = asyncio.get_running_loop().time()
+                    logger.debug(f"尝试模糊匹配撤回消息 {recalled_message_id}。当前 Pending 列表: {list(self.pending_llm_requests.keys())}")
+                    
+                    for pending_id, info in self.pending_llm_requests.items():
+                        # 忽略已取消的
+                        if info.get("cancelled", False):
+                            continue
+                            
+                        pending_event = info.get("event")
+                        if not pending_event:
+                            continue
+                            
+                        # 检查时间窗口 (60秒内)
+                        if current_time - info["timestamp"] > 60:
+                            continue
+
+                        # 检查发送者是否一致
+                        if str(pending_event.get_sender_id()) != user_id:
+                            continue
+                            
+                        # 检查会话是否一致
+                        session_match = False
+                        if notice_type == "group_recall":
+                            # 群撤回：检查群号
+                            if str(pending_event.get_group_id()) == group_id:
+                                session_match = True
+                        elif notice_type == "friend_recall":
+                            # 私聊撤回：检查是否为私聊且对方ID一致
+                            if pending_event.is_private_chat() and str(pending_event.get_sender_id()) == user_id:
+                                session_match = True
+                        
+                        if session_match:
+                            matched_request = info
+                            match_type = f"模糊匹配 (Pending ID: {pending_id})"
+                            logger.info(f"模糊匹配成功: 撤回ID {recalled_message_id} -> 请求ID {pending_id}")
+                            break
+
+                if matched_request:
+                    matched_request["cancelled"] = True
 
                     # 尝试停止相关事件
-                    if "event" in request_info:
-                        request_info["event"].stop_event()
+                    if "event" in matched_request:
+                        matched_request["event"].stop_event()
 
-                    logger.info(f"已取消对应的LLM回复: {recalled_message_id}")
+                    logger.info(f"已取消对应的LLM回复: {recalled_message_id} [{match_type}]")
                 else:
-                    logger.debug(f"撤回的消息 {recalled_message_id} 没有对应的LLM请求")
+                    logger.debug(f"撤回的消息 {recalled_message_id} 没有找到对应的LLM请求 (精确或模糊)")
 
                 # 阻止此撤回事件继续传播
                 event.stop_event()
         except Exception as e:
             # 记录异常信息以便调试，但不阻断处理流程
-            logger.debug(f"处理撤回事件时出现异常: {e}")
+            logger.error(f"处理撤回事件时出现异常: {e}", exc_info=True)
             pass
 
     async def _cleanup_expired_records(self):
@@ -208,8 +307,18 @@ class RecallCancelPlugin(Star):
                         expired_requests.append(msg_id)
 
                 for msg_id in expired_requests:
-                    del self.pending_llm_requests[msg_id]
+                    self.pending_llm_requests.pop(msg_id, None)
                     logger.debug(f"清理过期LLM请求记录: {msg_id}")
+                
+                # 清理超过5分钟的撤回消息记录
+                expired_recalls = []
+                for msg_id, info in list(self.recalled_messages.items()):
+                    if current_time - info["timestamp"] > 300: # 5分钟
+                        expired_recalls.append(msg_id)
+                
+                for msg_id in expired_recalls:
+                    self.recalled_messages.pop(msg_id, None)
+                    # logger.debug(f"清理过期撤回记录: {msg_id}") # 过于频繁，注释掉
 
             except asyncio.CancelledError:
                 break
@@ -226,6 +335,7 @@ class RecallCancelPlugin(Star):
                 pass
 
         self.pending_llm_requests.clear()
+        self.recalled_messages.clear()
         logger.info("RecallCancelPlugin 已卸载")
 
 
