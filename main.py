@@ -56,17 +56,19 @@ class RecallCancelPlugin(Star):
             
             # 2. 模糊匹配检查：检查同一发送者、同一会话、短时间内的撤回
             # 这可以处理消息ID变化的情况，以及消息ID获取不一致的问题
-            sender_id = event.get_sender_id()
-            group_id = event.get_group_id()
+            # 统一转换为字符串进行比较
+            sender_id = str(event.get_sender_id())
+            group_id = str(event.get_group_id()) if not event.is_private_chat() else ""
             is_private = event.is_private_chat()
             
-            for recalled_id, info in self.recalled_messages.items():
-                # 时间窗口检查 (5秒内，考虑到网络延迟)
-                if current_time - info["timestamp"] > 5:
+            # 将字典转换为列表以避免在迭代期间修改字典导致的RuntimeError
+            for recalled_id, info in list(self.recalled_messages.items()):
+                # 时间窗口检查 (10秒内，考虑到网络延迟和处理时间)
+                if current_time - info["timestamp"] > 10:
                     continue
                 
-                # 检查发送者
-                if info["user_id"] != sender_id:
+                # 检查发送者 (统一转str)
+                if str(info["user_id"]) != sender_id:
                     continue
                 
                 # 检查会话环境
@@ -74,7 +76,7 @@ class RecallCancelPlugin(Star):
                 if is_private and info["is_private"]:
                     # 私聊匹配
                     is_match = True
-                elif not is_private and not info["is_private"] and info["group_id"] == group_id:
+                elif not is_private and not info["is_private"] and str(info["group_id"]) == group_id:
                     # 群聊匹配
                     is_match = True
                 
@@ -203,17 +205,25 @@ class RecallCancelPlugin(Star):
                 "group_recall",
                 "friend_recall",
             ]:
-                # 直接检查 message_id 是否有效
+                # 兼容 message_id 为空的情况，尝试使用 operator_id (部分协议实现可能不同)
+                # 但主要还是依赖 message_id
                 if not message_id:
-                    logger.debug("撤回事件中的message_id无效，忽略")
-                    return
+                    logger.warning(f"撤回事件中的message_id无效: {raw_message}，尝试继续处理以支持模糊匹配")
+                    # 生成一个临时ID用于模糊匹配记录，避免空键
+                    import uuid
+                    recalled_message_id = f"unknown_{uuid.uuid4()}"
+                else:
+                    recalled_message_id = str(message_id)
 
-                recalled_message_id = str(message_id)
                 logger.info(f"检测到消息撤回: {recalled_message_id} (类型: {notice_type})")
                 
                 # 提取上下文信息
                 group_id = str(get_value(raw_message, "group_id", ""))
                 user_id = str(get_value(raw_message, "user_id", "")) # 消息发送者
+                if not user_id:
+                     # 如果没有user_id (如operator_id)，尝试获取 operator_id
+                     user_id = str(get_value(raw_message, "operator_id", ""))
+
                 is_private = notice_type == "friend_recall"
                 
                 # 记录撤回的消息，防止后续可能的LLM请求 (处理竞态条件)
