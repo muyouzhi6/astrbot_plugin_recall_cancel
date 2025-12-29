@@ -2,7 +2,7 @@
 
 > **作者**: 木有知  
 > **仓库**: [https://github.com/muyouzhi6/astrbot_plugin_recall_cancel](https://github.com/muyouzhi6/astrbot_plugin_recall_cancel)  
-> **版本**: v1.1.1 
+> **版本**: v1.2.0 
 > **标签**: 消息管理 | 撤回处理 | LLM控制 | 用户体验 | 自动化
 
 ## 📋 功能说明
