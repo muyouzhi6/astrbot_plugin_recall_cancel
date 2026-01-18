@@ -1,5 +1,5 @@
 name: astrbot_plugin_recall_cancel
-desc: “你撤回了我就当你没发过”，当用户撤回触发LLM回应的消息时，如果LLM回复还未发送则取消发送。防止用户发错消息撤回后机器人仍然回复的情况，提升用户体验并避免资源浪费。
+desc: 当用户撤回触发LLM回应的消息时，如果LLM回复还未发送则取消发送。v2.0.0 完全重构，修复消息ID匹配问题，支持与 context_aware 插件联动清理上下文记录。
 repo: https://github.com/muyouzhi6/astrbot_plugin_recall_cancel
 author: 木有知
-version: v1.2.0
+version: v2.0.0
