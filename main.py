@@ -101,6 +101,10 @@ class RecallStateManager:
         self._pending_requests: dict[str, PendingRequest] = {}
         self._recalled_messages: dict[str, RecalledMessage] = {}
         self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _compose_key(unified_msg_origin: str, message_id: str) -> str:
+        return f"{unified_msg_origin}::{message_id}"
     
     async def add_pending_request(
         self,
@@ -110,8 +114,9 @@ class RecallStateManager:
         event: AstrMessageEvent | None = None,
     ) -> None:
         """添加待处理的 LLM 请求"""
+        key = self._compose_key(unified_msg_origin, message_id)
         async with self._lock:
-            self._pending_requests[message_id] = PendingRequest(
+            self._pending_requests[key] = PendingRequest(
                 message_id=message_id,
                 unified_msg_origin=unified_msg_origin,
                 sender_id=sender_id,
@@ -119,15 +124,21 @@ class RecallStateManager:
                 event=event,
             )
     
-    async def remove_pending_request(self, message_id: str) -> PendingRequest | None:
+    async def remove_pending_request(
+        self, message_id: str, unified_msg_origin: str
+    ) -> PendingRequest | None:
         """移除待处理的请求"""
+        key = self._compose_key(unified_msg_origin, message_id)
         async with self._lock:
-            return self._pending_requests.pop(message_id, None)
+            return self._pending_requests.pop(key, None)
     
-    async def get_pending_request(self, message_id: str) -> PendingRequest | None:
+    async def get_pending_request(
+        self, message_id: str, unified_msg_origin: str
+    ) -> PendingRequest | None:
         """获取待处理的请求"""
+        key = self._compose_key(unified_msg_origin, message_id)
         async with self._lock:
-            return self._pending_requests.get(message_id)
+            return self._pending_requests.get(key)
     
     async def add_recalled_message(
         self,
@@ -136,29 +147,37 @@ class RecallStateManager:
         operator_id: str,
     ) -> None:
         """添加已撤回的消息记录"""
+        key = self._compose_key(unified_msg_origin, message_id)
         async with self._lock:
-            self._recalled_messages[message_id] = RecalledMessage(
+            self._recalled_messages[key] = RecalledMessage(
                 message_id=message_id,
                 unified_msg_origin=unified_msg_origin,
                 operator_id=operator_id,
                 timestamp=time.time(),
             )
     
-    async def is_recalled(self, message_id: str) -> bool:
+    async def is_recalled(self, message_id: str, unified_msg_origin: str) -> bool:
         """检查消息是否已被撤回"""
+        key = self._compose_key(unified_msg_origin, message_id)
         async with self._lock:
-            return message_id in self._recalled_messages
+            return key in self._recalled_messages
     
-    async def get_recalled_message(self, message_id: str) -> RecalledMessage | None:
+    async def get_recalled_message(
+        self, message_id: str, unified_msg_origin: str
+    ) -> RecalledMessage | None:
         """获取撤回记录"""
+        key = self._compose_key(unified_msg_origin, message_id)
         async with self._lock:
-            return self._recalled_messages.get(message_id)
+            return self._recalled_messages.get(key)
     
-    async def mark_context_aware_cleaned(self, message_id: str) -> None:
+    async def mark_context_aware_cleaned(
+        self, message_id: str, unified_msg_origin: str
+    ) -> None:
         """标记 context_aware 已清理"""
+        key = self._compose_key(unified_msg_origin, message_id)
         async with self._lock:
-            if message_id in self._recalled_messages:
-                self._recalled_messages[message_id].cleaned_context_aware = True
+            if key in self._recalled_messages:
+                self._recalled_messages[key].cleaned_context_aware = True
     
     async def cleanup_expired(self, expire_seconds: float = RECORD_EXPIRE_SECONDS) -> int:
         """清理过期记录，返回清理数量"""
@@ -326,8 +345,9 @@ class Main(star.Star):
             if msg_id:
                 # 检查是否为 UUID（撤回事件会生成新 UUID，需要排除）
                 msg_id_str = str(msg_id)
-                # UUID 格式检测（32位十六进制）
-                if len(msg_id_str) == 32 and msg_id_str.isalnum():
+                # UUID 格式检测（32位十六进制，允许带短横线）
+                compact = msg_id_str.replace("-", "")
+                if len(compact) == 32 and compact.isalnum():
                     # 可能是 UUID，尝试从 raw_message 获取真实 ID
                     return None
                 return msg_id_str
@@ -415,7 +435,7 @@ class Main(star.Star):
         )
         
         # 检查是否有正在处理的 LLM 请求
-        pending = await self._state.get_pending_request(recalled_msg_id)
+        pending = await self._state.get_pending_request(recalled_msg_id, umo)
         if pending and pending.event:
             logger.info(
                 f"[RecallCancel] 找到待处理的 LLM 请求，正在取消 | "
@@ -428,7 +448,7 @@ class Main(star.Star):
         # 清理 context_aware 中的消息
         if self._context_aware.remove_message(umo, recalled_msg_id):
             self._stats.context_aware_cleaned += 1
-            await self._state.mark_context_aware_cleaned(recalled_msg_id)
+            await self._state.mark_context_aware_cleaned(recalled_msg_id, umo)
         
         # 同时删除可能已记录的 Bot 响应
         self._context_aware.remove_last_bot_response(umo)
@@ -461,7 +481,7 @@ class Main(star.Star):
         )
         
         # 检查是否已被撤回
-        if await self._state.is_recalled(msg_id):
+        if await self._state.is_recalled(msg_id, umo):
             logger.info(
                 f"[RecallCancel] LLM 请求阶段拦截 | "
                 f"消息已被撤回，阻止请求 | 消息ID: {msg_id}"
@@ -480,9 +500,10 @@ class Main(star.Star):
         msg_id = self._get_message_id(event)
         if not msg_id:
             return
+        umo = event.unified_msg_origin
         
         # 检查是否已被撤回
-        if await self._state.is_recalled(msg_id):
+        if await self._state.is_recalled(msg_id, umo):
             logger.info(
                 f"[RecallCancel] LLM 响应阶段拦截 | "
                 f"消息已被撤回，阻止响应 | 消息ID: {msg_id}"
@@ -491,7 +512,6 @@ class Main(star.Star):
             self._stats.llm_responses_blocked += 1
             
             # 清理 context_aware 中可能已记录的 Bot 响应
-            umo = event.unified_msg_origin
             self._context_aware.remove_last_bot_response(umo)
     
     @filter.on_decorating_result(priority=100)  # 高优先级
@@ -500,12 +520,13 @@ class Main(star.Star):
         msg_id = self._get_message_id(event)
         if not msg_id:
             return
+        umo = event.unified_msg_origin
         
         # 短暂延迟，给撤回事件更多时间传入
         await asyncio.sleep(0.1)
         
         # 检查是否已被撤回
-        if await self._state.is_recalled(msg_id):
+        if await self._state.is_recalled(msg_id, umo):
             logger.info(
                 f"[RecallCancel] 发送阶段拦截 | "
                 f"消息已被撤回，阻止发送 | 消息ID: {msg_id}"
@@ -514,7 +535,6 @@ class Main(star.Star):
             self._stats.send_blocked += 1
             
             # 清理 context_aware
-            umo = event.unified_msg_origin
             self._context_aware.remove_last_bot_response(umo)
     
     @filter.after_message_sent(priority=100)
@@ -525,7 +545,7 @@ class Main(star.Star):
             return
         
         # 移除待处理记录
-        await self._state.remove_pending_request(msg_id)
+        await self._state.remove_pending_request(msg_id, event.unified_msg_origin)
         logger.debug(f"[RecallCancel] 消息已发送，清理记录 | 消息ID: {msg_id}")
     
     # -------------------------------------------------------------------------
