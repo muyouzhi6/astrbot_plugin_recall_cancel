@@ -1,5 +1,5 @@
 name: astrbot_plugin_recall_cancel
-desc: 当用户撤回触发LLM回应的消息时，如果LLM回复还未发送则取消发送。v2.0.0 完全重构，修复消息ID匹配问题，支持与 context_aware 插件联动清理上下文记录。
+desc: 当用户撤回触发LLM回应的消息时，如果LLM回复还未发送则取消发送。v2.0.1 修复撤回状态键作用域，避免跨会话 message_id 冲突；兼容 context_aware 联动清理。
 repo: https://github.com/muyouzhi6/astrbot_plugin_recall_cancel
 author: 木有知
-version: v2.0.0
+version: v2.0.1

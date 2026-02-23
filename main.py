@@ -1,5 +1,5 @@
 """
-AstrBot 撤回取消回复插件 v2.0.0 (Recall Cancel)
+AstrBot 撤回取消回复插件 v2.0.1 (Recall Cancel)
 
 当用户撤回消息时，自动取消正在处理的 LLM 回复，防止 Bot 回复已撤回的消息。
 
@@ -8,7 +8,7 @@ AstrBot 撤回取消回复插件 v2.0.0 (Recall Cancel)
 - LLM 拦截: 在多个阶段检查撤回状态并阻止回复
 - 上下文清理: 同时清理 context_aware 插件中已记录的消息（如已安装）
 
-v2.0.0 重构:
+v2.0.1 更新:
 - 修复消息ID匹配问题：正确从撤回事件中提取被撤回消息的原始ID
 - 修复撤回事件监听：使用正确的事件过滤器
 - 新增 context_aware 集成：撤回时同步清理 context_aware 中的消息记录
@@ -16,7 +16,7 @@ v2.0.0 重构:
 - 增强日志：详细的调试信息
 
 Author: 木有知
-Version: 2.0.0
+Version: 2.0.1
 """
 
 from __future__ import annotations
@@ -315,7 +315,7 @@ class Main(star.Star):
         self._context_aware = ContextAwareIntegration(context)
         self._cleanup_task: asyncio.Task | None = None
         
-        logger.info("[RecallCancel] 插件 v2.0.0 已加载")
+        logger.info("[RecallCancel] 插件 v2.0.1 已加载")
     
     # -------------------------------------------------------------------------
     # 消息 ID 提取
